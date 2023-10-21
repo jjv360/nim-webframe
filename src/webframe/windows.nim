@@ -9,7 +9,25 @@ import classes
 import winim/com
 import ./windows_wrl
 import ./windows_webview2
+
+
+## Useful functions from uxtheme.dll
+dynamicImport("uxtheme.dll"):
+
+    ## Preferred app modes
+    type PreferredAppMode = enum 
+        APPMODE_DEFAULT = 0
+        APPMODE_ALLOWDARK = 1
+        APPMODE_FORCEDARK = 2
+        APPMODE_FORCELIGHT = 3
+        APPMODE_MAX = 4
+
+    ## Set the preferred app mode, mainly changes context menus
+    proc SetPreferredAppMode(mode : PreferredAppMode) {.stdcall, winapiOrdinal: 135, winapiVersion: "10.0.17763".}
     
+
+## If true (the default), will apply WinApi styling (dark mode support, HiDPI, etc) on first init of a WebFrame.
+var WebFrameApplyWinApiStyling* = true
 
 ## List of all active windows
 var activeHWNDs: Table[HWND, RootRef]
@@ -68,6 +86,22 @@ class WebFrame:
     
     ## Constructor
     method init() =
+
+        # Apply styling
+        var HasAppliedStyling {.global.} = false
+        if WebFrameApplyWinApiStyling and not HasAppliedStyling:
+
+            # Set DPI awareness
+            SetProcessDPIAware()
+
+            # Allow app to be in dark mode if the system is in dark mode
+            try:
+                SetPreferredAppMode(APPMODE_ALLOWDARK)
+            except:
+                echo "Failed to set dark mode support: " & getCurrentExceptionMsg()
+
+            # Done
+            HasAppliedStyling = true
 
         # Initialize COM
         CoInitializeEx(nil, COINIT_APARTMENTTHREADED)
@@ -135,6 +169,15 @@ class WebFrame:
         # Get WebView2
         res = this.wv2controller.lpVtbl.get_CoreWebView2(this.wv2controller, this.wv2webview.addr)
         checkHResult(res)
+
+        # Add listener for when the title changes
+        var eventToken : pointer = nil
+        res = this.wv2webview.lpVtbl.add_DocumentTitleChanged(this.wv2webview, newWRLCallback(proc (arg : ptr IUnknown) =
+
+            # Set window title to match the document
+            SetWindowTextW(this.hwnd, this.documentTitle())
+
+        ), eventToken.addr)
 
         # Navigate now if they've set a URL
         if this.lastSetURL != "":
@@ -235,6 +278,50 @@ class WebFrame:
         # Navigate
         let res2 = this.wv2webview.lpVtbl.Navigate(this.wv2webview, url)
         checkHResult(res2)
+
+
+    ## Get current document title
+    method documentTitle() : string =
+
+        # Stop if no web view
+        if this.wv2webview == nil:
+            return ""
+
+        # Get URL
+        var str : LPWSTR
+        let res2 = this.wv2webview.lpVtbl.get_DocumentTitle(this.wv2webview, str.addr)
+        checkHResult(res2)
+        let str2 = $str
+
+        # Free memory
+        CoTaskMemFree(str)
+        return str2
+
+
+    ## Set window size
+    method setSize(width : int, height : int, center : bool = false) =
+
+        # Check if we should center
+        if center:
+
+            # Calculate position for the center of the screen
+            let x       : DWORD = (GetSystemMetrics(SM_CXSCREEN) - width.DWORD) div 2
+            let y       : DWORD = (GetSystemMetrics(SM_CYSCREEN) - height.DWORD) div 2
+
+            # Resize and move window
+            SetWindowPos(this.hwnd, 0, x, y, width.DWORD, height.DWORD, SWP_NOZORDER)
+
+        else:
+
+            # Just resize without moving
+            SetWindowPos(this.hwnd, 0, 0, 0, width.DWORD, height.DWORD, SWP_NOMOVE or SWP_NOZORDER)
+
+
+    ## Set window position
+    method setPosition(x : int, y : int) =
+
+        # Move window
+        SetWindowPos(this.hwnd, 0, x.DWORD, y.DWORD, 0, 0, SWP_NOSIZE or SWP_NOZORDER)
 
     
     ## WndProc callback

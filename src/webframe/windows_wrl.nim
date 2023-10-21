@@ -16,15 +16,17 @@ type
         outputObject : ptr T
         resultCode : HRESULT
         isComplete : bool
+        codeCallback : proc(incomingObject : ptr T) {.closure.}
 
 
 ## Create new WRLCallback
-proc newWRLCallback* [T] () : WRLCallback[T] =
+proc newWRLCallback* [T] (codeCallback : proc(incomingObject : ptr T) {.closure.} = nil) : WRLCallback[T] =
 
     # Create callback class
     var callback = WRLCallback[T]()
     callback.refCount = 0
     callback.isComplete = false
+    callback.codeCallback = codeCallback
     callback.lpVtbl = callback.vtbl.addr
     callback.lpVtbl.QueryInterface = proc(this: ptr IUnknown, riid: REFIID, ppvObject: ptr pointer) : HRESULT {.stdcall.} =
 
@@ -59,7 +61,14 @@ proc newWRLCallback* [T] () : WRLCallback[T] =
         this.isComplete = true
 
         # Increase reference count on the returned object so it isn't immediately disposed by the owner
-        discard outputObject.lpVtbl.AddRef(outputObject)
+        if outputObject != nil:
+            discard outputObject.lpVtbl.AddRef(outputObject)
+
+        # If there is a callback, call it
+        if this.codeCallback != nil:
+            this.codeCallback(this.outputObject)
+
+        # Done
         return S_OK
 
     # Manually increase ref count so the object is not removed until the remote side is done with it
