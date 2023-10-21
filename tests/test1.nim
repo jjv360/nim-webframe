@@ -6,6 +6,7 @@ import std/asyncdispatch
 
 # Create web frame
 var webview = WebFrame.init()
+webview.url = "https://google.com"
 
 # Log engine version
 echo "WebFrame engine: " & webview.engineVersion()

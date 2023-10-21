@@ -6,20 +6,9 @@ import stdx/dynlib
 import std/asyncdispatch
 import std/tables
 import classes
-import winim/clr
-
-# Embed + import WebView2Loader.dll ... from the NuGet package: https://www.nuget.org/packages/Microsoft.Web.WebView2
-# Path inside NuGet package: /runtimes/win-<arch>/native/WebView2Loader.dll
-# Documentation: https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl
-# const dllName = "WebView2Loader_" & hostCPU & ".dll"
-# const dllData = staticRead(dllName)
-# dynamicImportFromData(dllName, dllData):
-
-#     ## Get the browser version info including channel name if it is not the WebView2 Runtime.
-#     proc GetAvailableCoreWebView2BrowserVersionString(browserExecutablePath : PCWSTR, versionInfo : ptr LPWSTR) : HRESULT {.stdcall.}
-
-#     ## Creates an evergreen WebView2 Environment using the installed WebView2 Runtime version.
-#     proc CreateCoreWebView2EnvironmentWithOptions(browserExecutablePath : PCWSTR, userDataFolder : PCWSTR, environmentOptions : pointer, environmentCreatedHandler : pointer) : HRESULT {.stdcall.}
+import winim/com
+import ./windows_wrl
+import ./windows_webview2
     
 
 ## List of all active windows
@@ -54,22 +43,6 @@ proc registerWindowClass*(): string =
     return WindowClassName
 
 
-## Check an HRESULT and throw an error if needed
-proc checkHResult(res : HRESULT, prefix : string = "") =
-    if res == S_OK: return
-    if res == CO_E_NOTINITIALIZED: raise newException(OSError, prefix & " COM was not initialized.")
-    if res == RPC_E_CHANGED_MODE: raise newException(OSError, prefix & " COM was initialized on a different thread.")
-    if res == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED): raise newException(OSError, prefix & " Unsupported.")
-    if res == HRESULT_FROM_WIN32(ERROR_INVALID_STATE): raise newException(OSError, prefix & " Specified options do not match the options of the WebViews that are currently running in the shared browser process.")
-    if res == HRESULT_FROM_WIN32(ERROR_DISK_FULL): raise newException(OSError, prefix & " Disk full.")
-    if res == HRESULT_FROM_WIN32(ERROR_PRODUCT_UNINSTALLED): raise newException(OSError, prefix & " Required WebView2 Runtime version is not installed.")
-    if res == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND): raise newException(OSError, prefix & " Could not find WebView2 runtime. Please check that it is installed.")
-    if res == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS): raise newException(OSError, prefix & " User data folder cannot be created because a file with the same name already exists.")
-    if res == E_ACCESSDENIED: raise newException(OSError, prefix & " Unable to create user data folder, Access Denied.")
-    if res == E_FAIL: raise newException(OSError, prefix & " Edge runtime unable to start.")
-    raise newException(OSError, prefix & " Unable to perform action. Error 0x" & res.uint.toHex)
-
-
 ## WebFrame main class, used to create and display web views.
 class WebFrame:
 
@@ -80,6 +53,18 @@ class WebFrame:
     ## This will cause the Windows event loop to stop running, and the program to exit if there's nothing else
     ## left for asyncdispatch to do.
     var quitOnClose = true
+
+    ## WebView2 Environment
+    var wv2environment : ptr ICoreWebView2Environment = nil
+
+    ## WebView2 Controller
+    var wv2controller : ptr ICoreWebView2Controller = nil
+
+    ## WebView2 instance
+    var wv2webview : ptr ICoreWebView2 = nil
+
+    ## Contains the URL set by the client if they set it before the web view was loaded
+    var lastSetURL = ""
     
     ## Constructor
     method init() =
@@ -99,18 +84,18 @@ class WebFrame:
 
         # Create window, initially hidden
         this.hwnd = CreateWindowExW(
-            0,                                  # Extra window styles (WS_EX_LAYERED?)
-            registerWindowClass(),              # Class name
-            "Loading...",                       # Window title
-            WS_OVERLAPPEDWINDOW,                # Window style
+            0,                                          # Extra window styles
+            registerWindowClass(),                      # Class name
+            "Loading...",                               # Window title
+            WS_OVERLAPPEDWINDOW,                        # Window style
 
             # Size and position, x, y, width, height
             x, y, width, height,
 
-            0,                                  # Parent window    
-            0,                                  # Menu
-            GetModuleHandle(nil),               # Instance handle
-            nil                                 # Extra data, unused since we're keeping track of windows separately
+            0,                                          # Parent window    
+            0,                                          # Menu
+            GetModuleHandle(nil),                       # Instance handle
+            nil                                         # Extra data, unused since we're keeping track of windows separately
         )
 
         # Store active HWND
@@ -126,64 +111,38 @@ class WebFrame:
     ## Load the web view asynchronously
     method loadWebView() {.async.} =
 
-        # The CreateCoreWebView2EnvironmentWithOptions function takes a Callback C++ class as a parameter. This is gonna be tricky...
-        # First let's create our fake C++ VTable
-        type CallbackVTable {.pure.} = object
-            QueryInterface: proc(this: pointer, riid: pointer, ppvObject: pointer) : HRESULT {.stdcall.}
-            AddRef: proc(this: pointer) : HRESULT {.stdcall.}
-            Release: proc(this: pointer) : HRESULT {.stdcall.}
-            Invoke: proc(this: pointer, env: pointer, res: HRESULT) : HRESULT {.stdcall.}
-
-        # Now let's create our fake C++ class itself
-        type CallbackClass {.pure.} = object
-            vtable: ptr CallbackVTable
-            refCount: uint
-            env : pointer
-            res : HRESULT
-            isComplete : bool
-
-        # Now let's create an instance of our fake C++ class
-        var callback = CallbackClass()
-        var vtbl = CallbackVTable()
-        callback.vtable = vtbl.addr
-        callback.vtable.QueryInterface = proc(thisPtr: pointer, riid: pointer, ppvObject: pointer) : HRESULT {.stdcall.} =
-            # let this = cast[ptr CallbackClass](thisPtr)
-            echo "QueryInterface"
-            return S_OK # <-- Really we should be checking GUID's but... meh
-        callback.vtable.AddRef = proc(thisPtr: pointer) : HRESULT {.stdcall.} =
-            let this = cast[ptr CallbackClass](thisPtr)
-            echo "AddRef"
-            this.refCount += 1
-            return S_OK
-        callback.vtable.Release = proc(thisPtr: pointer) : HRESULT {.stdcall.} =
-            let this = cast[ptr CallbackClass](thisPtr)
-            echo "Release"
-            if this.refCount > 0: this.refCount -= 1
-            return S_OK
-        callback.vtable.Invoke = proc(thisPtr: pointer, env: pointer, res: HRESULT) : HRESULT {.stdcall.} =
-            let this = cast[ptr CallbackClass](thisPtr)
-            echo "Invoke"
-            this.env = env
-            this.res = res
-            this.isComplete = true
-            return S_OK
-        callback.refCount = 1
+        # Create path to the temporary profile folder
+        let tempDir = getTempDir() / "nim-webframe" / (getAppFilename().lastPathPart() & ".WebView2")
 
         # Create the WebView2 environment
-        let res = CreateCoreWebView2EnvironmentWithOptions(nil, nil, nil, callback.addr)
+        var callback = newWRLCallback[ICoreWebView2Environment]()
+        var res = CreateCoreWebView2EnvironmentWithOptions(nil, tempDir, nil, callback)
         checkHResult(res, "Failed to create WebView2 environment.")
+        this.wv2environment = await callback.getResult()
+        
+        # Create the controller
+        var callback2 = newWRLCallback[ICoreWebView2Controller]()
+        res = this.wv2environment.lpVtbl.CreateCoreWebView2Controller(this.wv2environment, this.hwnd, callback2)
+        checkHResult(res, "Failed to create WebView2 controller.")
+        this.wv2controller = await callback2.getResult()
 
-        # Wait for it to complete
-        while not callback.isComplete:
-            await sleepAsync(10)
+        # Resize view to fill the window
+        var bounds = RECT()
+        GetClientRect(this.hwnd, bounds)
+        res = this.wv2controller.lpVtbl.put_Bounds(this.wv2controller, bounds)
+        checkHResult(res, "Failed to resize WebView2 controller.")
 
-        # Check for error
-        echo "HERE ", callback.env.repr
-        checkHResult(callback.res, "Failed to create async WebView2 environment.")
+        # Get WebView2
+        res = this.wv2controller.lpVtbl.get_CoreWebView2(this.wv2controller, this.wv2webview.addr)
+        checkHResult(res)
 
-        # Loaded! Extract the COM class
-        echo "Loaded WebView2 environment."
-        echo callback.env.repr
+        # Navigate now if they've set a URL
+        if this.lastSetURL != "":
+
+            # Navigate
+            res = this.wv2webview.lpVtbl.Navigate(this.wv2webview, this.lastSetURL)
+            checkHResult(res)
+
 
 
     ## Gets the engine version string
@@ -244,6 +203,39 @@ class WebFrame:
         # Remove from active HWNDs
         activeHWNDs.del(this.hwnd)
 
+
+    ## Get current URL
+    method url() : string =
+
+        # Stop if no web view
+        if this.wv2webview == nil:
+            return ""
+
+        # Get URL
+        var uri : LPWSTR
+        let res2 = this.wv2webview.lpVtbl.get_Source(this.wv2webview, uri.addr)
+        checkHResult(res2)
+        let url = $uri
+
+        # Free memory
+        CoTaskMemFree(uri)
+        return url
+
+
+    ## Set current URL
+    method `url=`(url : string) =
+
+        # Store it
+        this.lastSetURL = url
+
+        # Stop if no web view
+        if this.wv2webview == nil:
+            return
+
+        # Navigate
+        let res2 = this.wv2webview.lpVtbl.Navigate(this.wv2webview, url)
+        checkHResult(res2)
+
     
     ## WndProc callback
     method wndProc(hwnd: HWND, uMsg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT =
@@ -257,6 +249,14 @@ class WebFrame:
             # Send shutdown message to the event loop
             if this.quitOnClose:
                 PostQuitMessage(0)
+
+        elif uMsg == WM_SIZE:
+
+            # Window was resized, resize the WebView2 controller as well
+            if this.wv2controller != nil:
+                var bounds = RECT()
+                GetClientRect(this.hwnd, bounds)
+                discard this.wv2controller.lpVtbl.put_Bounds(this.wv2controller, bounds)
 
         else:
 
